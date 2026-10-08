@@ -70,19 +70,33 @@ def jid_to_phone(jid):
 
 def send(uid, text):
     try:
-        todus_client.send_message(uid, text)
+        return todus_client.send_message(uid, text)
     except Exception as e:
         log.warning(f"send a {uid} falló: {e}")
+        return None
 
-def send_throttled(uid, key, text, interval=3.0):
+def edit(uid, msg_id, text):
+    """Edita un mensaje existente. Si falla, envía uno nuevo."""
+    if not msg_id:
+        return send(uid, text)
+    try:
+        todus_client.edit_message(uid, text, msg_id)
+        return msg_id
+    except Exception as e:
+        log.warning(f"edit a {uid} falló: {e}, enviando nuevo")
+        return send(uid, text)
+
+def send_throttled(uid, key, text, interval=3.0, edit_msg_id=None):
     now = time.time()
     if now - _status_throttle.get(key, 0) < interval:
-        return
+        return None
     _status_throttle[key] = now
-    send(uid, text)
+    if edit_msg_id:
+        return edit(uid, edit_msg_id, text)
+    return send(uid, text)
 
 class QueuedJob:
-    __slots__ = ("job_id","user_id","kind","url","original_name","task","created_at","cancel_requested")
+    __slots__ = ("job_id","user_id","kind","url","original_name","task","created_at","cancel_requested","status_msg_id")
     def __init__(self, user_id, kind, url=None, original_name=None):
         self.job_id = uuid.uuid4().hex
         self.user_id = user_id
@@ -92,6 +106,7 @@ class QueuedJob:
         self.task = None
         self.created_at = time.time()
         self.cancel_requested = False
+        self.status_msg_id = None
 
 class JobQueue:
     def __init__(self, n_workers):
@@ -173,7 +188,7 @@ class JobQueue:
                 if job.cancel_requested:
                     continue
                 await self.mark_active(job)
-                send(job.user_id, "▶️ Procesando tu enlace...")
+                job.status_msg_id = send(job.user_id, "▶️ Procesando tu enlace...")
                 job.task = asyncio.create_task(process_fn(job))
                 try:
                     await job.task
@@ -239,8 +254,10 @@ async def subir_a_s3(temp_path, filename, size, uid, job_id):
     key = f"up:{uid}:{job_id}"
 
     def _progress_callback(bytes_transferred):
+        if bytes_transferred >= size:
+            return
         now = loop.time()
-        if now - last_update[0] < 3.0 and bytes_transferred < size:
+        if now - last_update[0] < 3.0:
             return
         last_update[0] = now
         pct = int(bytes_transferred / size * 100) if size else 0
@@ -294,7 +311,7 @@ async def _download_sequential(session, url, temp_path, total, job):
                             job.user_id, key,
                             f"📥 Descargando... {pct}%\n[{progress_bar(pct)}]\n"
                             f"{format_size(downloaded)}/{format_size(total)}",
-                            3.0,
+                            3.0, edit_msg_id=job.status_msg_id,
                         )
     return downloaded
 
@@ -330,7 +347,7 @@ async def _download_parallel(session, url, temp_path, total, job):
                                 job.user_id, key,
                                 f"📥 Descargando (x{n_parts})... {pct}%\n"
                                 f"[{progress_bar(pct)}]",
-                                3.0,
+                                3.0, edit_msg_id=job.status_msg_id,
                             )
         return path
 
@@ -379,7 +396,7 @@ async def _process_url(job):
 
         url_final = await subir_a_s3(temp_path, filename, size, job.user_id, job.job_id)
 
-        name = os.path.splitext(filename)[0].replace("_", " ")
+        name = re.sub(r"^[0-9a-f]{8}_", "", os.path.splitext(filename)[0]).replace("_", " ")
         ext_out = os.path.splitext(filename)[1].replace(".", "")
         send(job.user_id,
             f"┎ NAME: {name}\n"
