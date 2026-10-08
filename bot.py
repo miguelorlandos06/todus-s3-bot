@@ -1,4 +1,4 @@
-import os, re, time, uuid, signal, asyncio, logging, threading
+import os, re, time, uuid, signal, asyncio, logging, threading, mimetypes
 from urllib.parse import urlparse, unquote, quote
 
 import aiofiles, aiohttp, aioboto3
@@ -19,7 +19,6 @@ S3_REGION = "us-east-1"
 DOWNLOAD_PATH = "/tmp/todus_uploads"
 PORT = 10000
 MAX_FILE_SIZE = 2000 * 1024 * 1024
-QUEUE_WORKERS = 1
 CHUNK_SIZE = 16 * 1024 * 1024
 WATCHDOG_LIFETIME = 14100
 PARALLEL_URL_DOWNLOAD = True
@@ -43,8 +42,6 @@ todus_client = ToDusClient2(TODUS_PHONE)
 if TODUS_JWT:
     todus_client.token = TODUS_JWT
 
-_status_throttle = {}
-
 _S3_CONFIG = BotoConfig(
     signature_version=UNSIGNED,
     retries={"max_attempts": 3, "mode": "adaptive"},
@@ -63,10 +60,12 @@ _s3_session = aioboto3.Session()
 
 _loop = None
 
+
 def jid_to_phone(jid):
     if not jid:
         return None
     return jid.split("@")[0].split("/")[0]
+
 
 def send(uid, text):
     try:
@@ -75,8 +74,8 @@ def send(uid, text):
         log.warning(f"send a {uid} falló: {e}")
         return None
 
+
 def edit(uid, msg_id, text):
-    """Edita un mensaje existente. Si falla, envía uno nuevo."""
     if not msg_id:
         return send(uid, text)
     try:
@@ -86,17 +85,9 @@ def edit(uid, msg_id, text):
         log.warning(f"edit a {uid} falló: {e}, enviando nuevo")
         return send(uid, text)
 
-def send_throttled(uid, key, text, interval=3.0, edit_msg_id=None):
-    now = time.time()
-    if now - _status_throttle.get(key, 0) < interval:
-        return None
-    _status_throttle[key] = now
-    if edit_msg_id:
-        return edit(uid, edit_msg_id, text)
-    return send(uid, text)
 
 class QueuedJob:
-    __slots__ = ("job_id","user_id","kind","url","original_name","task","created_at","cancel_requested","status_msg_id")
+    __slots__ = ("job_id", "user_id", "kind", "url", "original_name", "task", "created_at", "cancel_requested")
     def __init__(self, user_id, kind, url=None, original_name=None):
         self.job_id = uuid.uuid4().hex
         self.user_id = user_id
@@ -106,125 +97,54 @@ class QueuedJob:
         self.task = None
         self.created_at = time.time()
         self.cancel_requested = False
-        self.status_msg_id = None
 
-class JobQueue:
-    def __init__(self, n_workers):
-        self.queue = asyncio.Queue()
-        self.n_workers = n_workers
-        self.workers = []
-        self.user_pending = {}
-        self.active_jobs = {}
+
+class SimpleLock:
+    def __init__(self):
+        self.active = {}
         self._lock = asyncio.Lock()
 
-    async def enqueue(self, job):
-        async with self._lock:
-            if job.user_id in self.user_pending:
-                raise ValueError("user_already_queued")
-            self.user_pending[job.user_id] = job
-            await self.queue.put(job)
-            return self.queue.qsize()
-
-    async def mark_active(self, job):
-        async with self._lock:
-            self.active_jobs[job.job_id] = job
-
-    async def finish(self, job):
-        async with self._lock:
-            self.active_jobs.pop(job.job_id, None)
-            current = self.user_pending.get(job.user_id)
-            if current is not None and current.job_id == job.job_id:
-                self.user_pending.pop(job.user_id, None)
-
-    def position_of(self, user_id):
-        job = self.user_pending.get(user_id)
-        if job is None:
-            return None
-        if job.job_id in self.active_jobs:
-            return 0
-        for i, queued in enumerate(self.queue._queue):
-            if queued.job_id == job.job_id:
-                return i + 1
-        return None
-
     def has_user_job(self, user_id):
-        return user_id in self.user_pending
+        return user_id in self.active
+
+    async def run(self, job, coro):
+        async with self._lock:
+            if job.user_id in self.active:
+                raise ValueError("user_already_running")
+            self.active[job.user_id] = job
+        try:
+            job.task = asyncio.create_task(coro)
+            await job.task
+        finally:
+            async with self._lock:
+                self.active.pop(job.user_id, None)
 
     async def cancel_user(self, user_id):
         async with self._lock:
-            job = self.user_pending.get(user_id)
+            job = self.active.get(user_id)
             if job is None:
                 return "none"
-            if job.job_id in self.active_jobs:
-                job.cancel_requested = True
-                task = job.task
-                if task is not None and not task.done():
-                    task.cancel()
-                return "active"
-            self.user_pending.pop(user_id, None)
-            items = list(self.queue._queue)
-            self.queue._queue.clear()
-            for item in items:
-                if item.job_id != job.job_id:
-                    self.queue._queue.append(item)
-            return "queued"
+            job.cancel_requested = True
+            if job.task and not job.task.done():
+                job.task.cancel()
+            return "active"
 
-    @property
-    def queued_count(self):
-        return self.queue.qsize()
 
-    @property
-    def active_count(self):
-        return len(self.active_jobs)
+job_queue = SimpleLock()
 
-    def start_workers(self, process_fn):
-        for i in range(self.n_workers):
-            self.workers.append(asyncio.create_task(self._worker_loop(i, process_fn)))
-
-    async def _worker_loop(self, worker_id, process_fn):
-        while True:
-            job = await self.queue.get()
-            try:
-                if job.cancel_requested:
-                    continue
-                await self.mark_active(job)
-                job.status_msg_id = send(job.user_id, "▶️ Procesando tu enlace...")
-                job.task = asyncio.create_task(process_fn(job))
-                try:
-                    await job.task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    log.exception(f"job {job.job_id} falló: {e}")
-            except asyncio.CancelledError:
-                raise
-            finally:
-                await self.finish(job)
-                self.queue.task_done()
-
-    async def stop_workers(self):
-        for w in self.workers:
-            w.cancel()
-        for w in self.workers:
-            try:
-                await w
-            except asyncio.CancelledError:
-                pass
-        self.workers.clear()
-
-job_queue = JobQueue(QUEUE_WORKERS)
 
 def format_size(b):
-    if b < 1024: return f"{b} B"
-    if b < 1048576: return f"{b / 1024:.1f} KB"
-    if b < 1073741824: return f"{b / 1048576:.1f} MB"
+    if b < 1024:
+        return f"{b} B"
+    if b < 1048576:
+        return f"{b / 1024:.1f} KB"
+    if b < 1073741824:
+        return f"{b / 1048576:.1f} MB"
     return f"{b / 1073741824:.2f} GB"
 
-def progress_bar(p):
-    filled = round(15 * p / 100)
-    return "⬢" * filled + "⬡" * (15 - filled)
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+?)(?=[.,;:!?)\]]?(\s|$))", re.IGNORECASE)
+
 
 def get_filename_from_url(url):
     try:
@@ -235,10 +155,12 @@ def get_filename_from_url(url):
         pass
     return None
 
+
 def sanitize_filename(name):
     name = name.replace("/", "_").replace("\\", "_")
     name = re.sub(r"[\s?#&]+", "_", name)
     return name.strip("._") or f"file_{int(time.time())}"
+
 
 def check_disk_space():
     st = os.statvfs(DOWNLOAD_PATH)
@@ -246,30 +168,10 @@ def check_disk_space():
     if free < 2 * 1024 * 1024 * 1024:
         raise RuntimeError(f"Disco insuficiente: {format_size(free)} libres")
 
-async def subir_a_s3(temp_path, filename, size, uid, job_id):
+
+async def subir_a_s3(temp_path, filename, size, uid, job_id, status_msg_id=None):
     safe_name = sanitize_filename(filename)
     remote_key = f"{uuid.uuid4().hex[:8]}_{safe_name}"
-    loop = asyncio.get_running_loop()
-    last_update = [0.0]
-    key = f"up:{uid}:{job_id}"
-
-    def _progress_callback(bytes_transferred):
-        if bytes_transferred >= size:
-            return
-        now = loop.time()
-        if now - last_update[0] < 3.0:
-            return
-        last_update[0] = now
-        pct = int(bytes_transferred / size * 100) if size else 0
-        asyncio.run_coroutine_threadsafe(
-            asyncio.to_thread(
-                send_throttled, uid, key,
-                f"☁️ Subiendo a toDus S3... {pct}%\n[{progress_bar(pct)}]",
-                3.0,
-            ),
-            loop,
-        )
-
     async with _s3_session.client(
         "s3",
         endpoint_url=S3_ENDPOINT,
@@ -283,17 +185,16 @@ async def subir_a_s3(temp_path, filename, size, uid, job_id):
                 f, S3_BUCKET, remote_key,
                 ExtraArgs={"ContentType": "application/octet-stream"},
                 Config=_TRANSFER_CONFIG,
-                Callback=_progress_callback,
             )
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
+
 
 async def process_job(job):
     await _process_url(job)
 
-async def _download_sequential(session, url, temp_path, total, job):
+
+async def _download_sequential(session, url, temp_path, total, job, status_msg_id):
     downloaded = 0
-    last_pct = -1
-    key = f"dl:{job.user_id}:{job.job_id}"
     async with aiofiles.open(temp_path, "wb") as f:
         async with session.get(url, headers=BROWSER_HEADERS) as resp:
             if resp.status >= 400:
@@ -303,19 +204,10 @@ async def _download_sequential(session, url, temp_path, total, job):
                 downloaded += len(chunk)
                 if downloaded > MAX_FILE_SIZE:
                     raise RuntimeError("Archivo supera el límite")
-                if total:
-                    pct = int(downloaded / total * 100)
-                    if pct - last_pct >= 10 or pct == 100:
-                        last_pct = pct
-                        send_throttled(
-                            job.user_id, key,
-                            f"📥 Descargando... {pct}%\n[{progress_bar(pct)}]\n"
-                            f"{format_size(downloaded)}/{format_size(total)}",
-                            3.0, edit_msg_id=job.status_msg_id,
-                        )
     return downloaded
 
-async def _download_parallel(session, url, temp_path, total, job):
+
+async def _download_parallel(session, url, temp_path, total, job, status_msg_id):
     n_parts = PARALLEL_URL_PARTS
     part_size = total // n_parts
     parts = []
@@ -323,10 +215,6 @@ async def _download_parallel(session, url, temp_path, total, job):
         start = i * part_size
         end = start + part_size - 1 if i < n_parts - 1 else total - 1
         parts.append((i, start, end))
-    progress = {"total": 0}
-    progress_lock = asyncio.Lock()
-    last_pct = [-1]
-    key = f"dl:{job.user_id}:{job.job_id}"
 
     async def download_part(idx, start, end):
         path = f"{temp_path}.part{idx}"
@@ -338,17 +226,6 @@ async def _download_parallel(session, url, temp_path, total, job):
             async with aiofiles.open(path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                     await f.write(chunk)
-                    async with progress_lock:
-                        progress["total"] += len(chunk)
-                        pct = int(progress["total"] / total * 100)
-                        if pct - last_pct[0] >= 10 or pct == 100:
-                            last_pct[0] = pct
-                            send_throttled(
-                                job.user_id, key,
-                                f"📥 Descargando (x{n_parts})... {pct}%\n"
-                                f"[{progress_bar(pct)}]",
-                                3.0, edit_msg_id=job.status_msg_id,
-                            )
         return path
 
     part_paths = await asyncio.gather(*[download_part(i, s, e) for i, s, e in parts])
@@ -366,13 +243,45 @@ async def _download_parallel(session, url, temp_path, total, job):
                 pass
     return total
 
+
+def _guess_mime_type(filename):
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
+
+
+def _send_media_to_user(uid, url_final, filename, size):
+    """Envía el archivo por toDus según su tipo (imagen, video, audio o documento)."""
+    ext = os.path.splitext(filename)[1].lower()
+    mime = _guess_mime_type(filename)
+
+    try:
+        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+            todus_client.send_image_message(uid, url_final, url_final)
+            return "image"
+        elif ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"):
+            todus_client.send_video_message(uid, url_final, None, 0, size)
+            return "video"
+        elif ext in (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac"):
+            todus_client.send_audio_message(uid, url_final, 0, size)
+            return "audio"
+        else:
+            todus_client.send_file_message(uid, url_final, size, mime, filename)
+            return "file"
+    except Exception as e:
+        log.warning(f"No se pudo enviar archivo a {uid}: {e}")
+        return None
+
+
 async def _process_url(job):
     url = job.url
     filename = sanitize_filename(get_filename_from_url(url) or f"file_{int(time.time())}")
     ext = os.path.splitext(filename)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+    status_msg_id = None
     try:
         check_disk_space()
+        status_msg_id = send(job.user_id, f"📥 Descargando {filename}...")
+
         async with aiohttp.ClientSession() as session:
             async with asyncio.timeout(1200):
                 total = 0
@@ -387,35 +296,50 @@ async def _process_url(job):
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
                 if PARALLEL_URL_DOWNLOAD and accepts_ranges and total >= PARALLEL_URL_MIN_SIZE:
-                    await _download_parallel(session, url, temp_path, total, job)
+                    await _download_parallel(session, url, temp_path, total, job, status_msg_id)
                 else:
-                    await _download_sequential(session, url, temp_path, total, job)
+                    await _download_sequential(session, url, temp_path, total, job, status_msg_id)
 
         size = os.path.getsize(temp_path)
-        send(job.user_id, f"✅ Descarga completa: {filename}\n📊 {format_size(size)}\n☁️ Subiendo a toDus S3...")
 
-        url_final = await subir_a_s3(temp_path, filename, size, job.user_id, job.job_id)
+        status_msg_id = edit(job.user_id, status_msg_id,
+            f"☁️ Subiendo a toDus S3...\n📊 {format_size(size)}")
+
+        url_final = await subir_a_s3(temp_path, filename, size, job.user_id, job.job_id, status_msg_id)
 
         name = re.sub(r"^[0-9a-f]{8}_", "", os.path.splitext(filename)[0]).replace("_", " ")
         ext_out = os.path.splitext(filename)[1].replace(".", "")
-        send(job.user_id,
-            f"┎ NAME: {name}\n"
-            f"┠ EXTENSION: {ext_out}\n"
-            f"┠ SIZE: {format_size(size)}\n"
-            f"┠ CLOUD: toDus S3\n"
-            f"┖ URL: {url_final}"
-        )
+
+        tipo = _send_media_to_user(job.user_id, url_final, filename, size)
+        if tipo:
+            log.info(f"✅ Enviado {tipo} a {job.user_id}: {filename}")
+            edit(job.user_id, status_msg_id,
+                f"┎ NAME: {name}\n"
+                f"┠ EXTENSION: {ext_out}\n"
+                f"┠ SIZE: {format_size(size)}\n"
+                f"┠ CLOUD: toDus S3\n"
+                f"┖ ✅ Enviado como {tipo}"
+            )
+        else:
+            edit(job.user_id, status_msg_id,
+                f"┎ NAME: {name}\n"
+                f"┠ EXTENSION: {ext_out}\n"
+                f"┠ SIZE: {format_size(size)}\n"
+                f"┠ CLOUD: toDus S3\n"
+                f"┖ URL: {url_final}"
+            )
     except asyncio.CancelledError:
-        send(job.user_id, "❌ Cancelado")
+        edit(job.user_id, status_msg_id, "❌ Cancelado")
         raise
     except Exception as e:
         log.exception("error procesando URL")
-        send(job.user_id, f"❌ Error: {str(e)[:200]}")
+        edit(job.user_id, status_msg_id, f"❌ Error: {str(e)[:200]}")
     finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
+
 
 def on_todus_message(msg):
     try:
@@ -434,10 +358,9 @@ def on_todus_message(msg):
             send(uid,
                 "🤖 Bot de subida a toDus S3\n\n"
                 "Envíame un enlace (http/https) y lo descargaré, "
-                "lo subiré a toDus S3 y te devolveré la URL.\n\n"
+                "lo subiré a toDus S3 y te devolveré el archivo.\n\n"
                 "Comandos:\n"
-                "/cancel — cancelar tu trabajo\n"
-                "/status — ver tu posición en la cola"
+                "/cancel — cancelar tu trabajo"
             )
             return
 
@@ -447,22 +370,8 @@ def on_todus_message(msg):
             ).result(timeout=5)
             if result == "none":
                 send(uid, "ℹ️ No tienes trabajos activos.")
-            elif result == "active":
-                send(uid, "❌ Cancelando tu trabajo activo...")
             else:
-                send(uid, "✅ Removido de la cola.")
-            return
-
-        if low == "/status":
-            pos = job_queue.position_of(uid)
-            tq = job_queue.queued_count
-            ta = job_queue.active_count
-            if pos is None:
-                send(uid, f"ℹ️ Sin trabajos.\n📊 Cola: {tq} esperando, {ta} procesando")
-            elif pos == 0:
-                send(uid, f"▶️ Procesándose ahora.\n📊 Cola: {tq} esperando, {ta} procesando")
-            else:
-                send(uid, f"⏳ Posición #{pos} de la cola.\n📊 Cola: {tq} esperando, {ta} procesando")
+                send(uid, "❌ Cancelado.")
             return
 
         match = URL_RE.search(body)
@@ -476,35 +385,33 @@ def on_todus_message(msg):
 
         url = match.group(1)
         job = QueuedJob(user_id=uid, kind="url", url=url)
-        try:
-            position = asyncio.run_coroutine_threadsafe(
-                job_queue.enqueue(job), _loop
-            ).result(timeout=5)
-        except ValueError:
-            send(uid, "⚠️ Ya tienes un trabajo en curso.")
-            return
-        send(uid, f"📥 En cola — posición #{position}")
+        asyncio.run_coroutine_threadsafe(
+            job_queue.run(job, process_job(job)), _loop
+        )
     except Exception as e:
         log.exception(f"on_todus_message: {e}")
 
+
 START_TIME = time.time()
+
 
 async def health_handler(request):
     return web.json_response({
         "status": "healthy",
         "uptime": round(time.time() - START_TIME, 1),
-        "queue_queued": job_queue.queued_count,
-        "queue_active": job_queue.active_count,
     })
+
 
 async def root_handler(request):
     return web.json_response({"status": "online"})
+
 
 def make_web_app():
     a = web.Application()
     a.router.add_get("/", root_handler)
     a.router.add_get("/health", health_handler)
     return a
+
 
 async def run_web():
     a = make_web_app()
@@ -513,6 +420,7 @@ async def run_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     return runner
+
 
 async def watchdog():
     while True:
@@ -525,12 +433,12 @@ async def watchdog():
             log.error("watchdog: forzando os._exit")
             os._exit(0)
 
+
 async def main():
     global _loop
     _loop = asyncio.get_running_loop()
 
     web_runner = await run_web()
-    job_queue.start_workers(process_job)
     asyncio.create_task(watchdog())
 
     todus_client.login_with_phone_only()
@@ -542,14 +450,14 @@ async def main():
     )
     listener_thread.start()
 
-    log.info(f"BOT READY — {QUEUE_WORKERS} workers, límite {format_size(MAX_FILE_SIZE)}")
+    log.info(f"BOT READY — límite {format_size(MAX_FILE_SIZE)}")
     try:
         await asyncio.Event().wait()
     finally:
         log.info("apagando limpiamente...")
-        await job_queue.stop_workers()
         await web_runner.cleanup()
         log.info("apagado completo")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
