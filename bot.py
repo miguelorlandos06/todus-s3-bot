@@ -1,4 +1,4 @@
-import os, re, time, uuid, signal, asyncio, logging, threading, mimetypes
+import os, re, time, uuid, signal, asyncio, logging, threading
 from urllib.parse import urlparse, unquote, quote
 
 import aiofiles, aiohttp, aioboto3
@@ -8,6 +8,7 @@ from botocore.config import Config as BotoConfig
 from boto3.s3.transfer import TransferConfig
 
 from todus import ToDusClient2
+from todus.types import FileType
 
 TODUS_PHONE = os.environ.get("TODUS_PHONE", "5350155246")
 TODUS_JWT = os.environ.get("TODUS_JWT")
@@ -145,6 +146,11 @@ def format_size(b):
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+?)(?=[.,;:!?)\]]?(\s|$))", re.IGNORECASE)
 
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".3gp"}
+AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
+VOICE_EXT = {".ogg", ".opus"}
+
 
 def get_filename_from_url(url):
     try:
@@ -244,29 +250,36 @@ async def _download_parallel(session, url, temp_path, total, job, status_msg_id)
     return total
 
 
-def _guess_mime_type(filename):
-    mime, _ = mimetypes.guess_type(filename)
-    return mime or "application/octet-stream"
-
-
 def _send_media_to_user(uid, url_final, filename, size):
-    """Envía el archivo por toDus según su tipo (imagen, video, audio o documento)."""
+    """Envía el archivo por toDus según su extensión. Devuelve el tipo enviado o None."""
     ext = os.path.splitext(filename)[1].lower()
-    mime = _guess_mime_type(filename)
-
     try:
-        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
-            todus_client.send_image_message(uid, url_final, url_final)
-            return "image"
-        elif ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"):
-            todus_client.send_video_message(uid, url_final, None, 0, size)
+        if ext in IMAGE_EXT:
+            todus_client.send_image_message_simple(uid, url_final, filename, size)
+            return "imagen"
+
+        if ext in VIDEO_EXT:
+            todus_client.send_video_message(
+                uid, url_final, "", filename, size, 0, 0, 0, ""
+            )
             return "video"
-        elif ext in (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac"):
-            todus_client.send_audio_message(uid, url_final, 0, size)
+
+        if ext in VOICE_EXT:
+            todus_client.send_voice_message(
+                uid, url_final, filename, size, 0
+            )
+            return "nota de voz"
+
+        if ext in AUDIO_EXT:
+            todus_client.send_file_message(
+                uid, url_final, FileType.AUDIO, "", filename, size
+            )
             return "audio"
-        else:
-            todus_client.send_file_message(uid, url_final, size, mime, filename)
-            return "file"
+
+        todus_client.send_file_message(
+            uid, url_final, FileType.FILE, "", filename, size
+        )
+        return "archivo"
     except Exception as e:
         log.warning(f"No se pudo enviar archivo a {uid}: {e}")
         return None
@@ -311,6 +324,7 @@ async def _process_url(job):
         ext_out = os.path.splitext(filename)[1].replace(".", "")
 
         tipo = _send_media_to_user(job.user_id, url_final, filename, size)
+
         if tipo:
             log.info(f"✅ Enviado {tipo} a {job.user_id}: {filename}")
             edit(job.user_id, status_msg_id,
