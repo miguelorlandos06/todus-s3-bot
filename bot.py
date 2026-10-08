@@ -520,7 +520,7 @@ async def main():
     log.info(f"✅ toDus login OK — {TODUS_PHONE}")
 
     listener_thread = threading.Thread(
-        target=lambda: todus_client.listen_messages(on_todus_message),
+        target=lambda: todus_client.listen_messages(todus_client.token, on_todus_message),
         daemon=True,
     )
     listener_thread.start()
