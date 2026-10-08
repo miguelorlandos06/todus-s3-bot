@@ -1,0 +1,25 @@
+name: ToDus S3 Bot
+on:
+  workflow_dispatch:
+concurrency:
+  group: todus-bot
+  cancel-in-progress: false
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 245
+    env:
+      TODUS_PHONE: ${{ secrets.TODUS_PHONE }}
+      TODUS_JWT: ${{ secrets.TODUS_JWT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - run: python bot.py
+      - if: always()
+        run: rm -rf /tmp/todus_uploads || true
