@@ -41,7 +41,7 @@ log = logging.getLogger("bot")
 
 todus_client = ToDusClient2(TODUS_PHONE)
 if TODUS_JWT:
-    to dus_client.token = TODUS_JWT
+    todus_client.token = TODUS_JWT
 
 _status_throttle = {}
 
@@ -70,7 +70,7 @@ def jid_to_phone(jid):
 
 def send(uid, text):
     try:
-        to dus_client.send_message(uid, text)
+        todus_client.send_message(uid, text)
     except Exception as e:
         log.warning(f"send a {uid} falló: {e}")
 
@@ -516,11 +516,11 @@ async def main():
     job_queue.start_workers(process_job)
     asyncio.create_task(watchdog())
 
-    to dus_client.login_with_phone_only()
+    todus_client.login_with_phone_only()
     log.info(f"✅ toDus login OK — {TODUS_PHONE}")
 
     listener_thread = threading.Thread(
-        target=lambda: to dus_client.listen_messages(on_todus_message),
+        target=lambda: todus_client.listen_messages(on_todus_message),
         daemon=True,
     )
     listener_thread.start()
